@@ -51,6 +51,33 @@ int main()
     Check(flags == originalFlags && steamId == 0, "native bot state restored");
     Check(std::memcmp(name, originalName.data(), sizeof(name)) == 0, "full name buffer restored byte for byte");
 
+    // Regression: controller-only snapshots left the pawn's FL_BOT visible.
+    std::uint32_t pawnFlags = kBot | 0x80200001u;
+    const auto originalPawnFlags = pawnFlags;
+    {
+        DisplayOverride controller(flags, steamId, name, sizeof(name), kDisplayIdBase + 1);
+        PawnDisplayOverride pawn(pawnFlags);
+        Check(!(flags & kFakeClient) && !(pawnFlags & kBot), "both bot markers cleared in the same snapshot");
+        Check(pawnFlags == (originalPawnFlags & ~kBot), "pawn movement flags preserved");
+        {
+            PawnDisplayOverride nested(pawnFlags);
+        }
+        Check(!(pawnFlags & kBot), "nested pawn restoration preserves outer override");
+    }
+    Check(flags == originalFlags && pawnFlags == originalPawnFlags, "controller and pawn native state restored");
+    {
+        PawnDisplayOverride deleted(pawnFlags);
+        deleted.Abandon();
+        pawnFlags = 0x42;
+    }
+    Check(pawnFlags == 0x42, "reused pawn is not restored");
+    pawnFlags = originalPawnFlags;
+    try {
+        PawnDisplayOverride pawn(pawnFlags);
+        throw std::runtime_error("packing failed");
+    } catch (const std::exception&) {}
+    Check(pawnFlags == originalPawnFlags, "pawn native state restored on exceptional exit");
+
     flags = 1;
     steamId = 76561198000000001ULL;
     {

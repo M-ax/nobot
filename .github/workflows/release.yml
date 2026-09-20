@@ -1,0 +1,146 @@
+name: Build and release Linux
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing version tag to publish (leave empty for a build only)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-${{ inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    env:
+      CC: gcc-13
+      CXX: g++-13
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          persist-credentials: false
+
+      - name: Validate release version
+        id: version
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import re
+
+          source = pathlib.Path('CMakeLists.txt').read_text()
+          version = re.search(r'project\(botmod VERSION (\d+\.\d+\.\d+)', source)[1]
+          tag = os.environ['REQUESTED_TAG']
+          if not tag and os.environ['GITHUB_REF_TYPE'] == 'tag':
+              tag = os.environ['GITHUB_REF_NAME']
+          if tag and tag != f'v{version}':
+              raise SystemExit(f'Release tag {tag!r} must match CMake version v{version}')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'version={version}\ntag={tag}\n')
+          PY
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y g++-13 ninja-build
+
+      - name: Fetch pinned dependencies
+        run: python3 scripts/fetch-deps.py
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_TESTING=ON
+          -DMMSOURCE="$PWD/.deps/metamod-source-api17"
+
+      - name: Build and test
+        run: |
+          cmake --build build --parallel 2
+          ctest --test-dir build --output-on-failure
+
+      - name: Prepare install downloads
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          cmake --install build --prefix dist/linux
+          cpack --config build/CPackConfig.cmake -B dist
+          mkdir -p release
+          cp "dist/botmod-${VERSION}-linuxsteamrt64.zip" release/botmod-linuxsteamrt64.zip
+          cp dist/linux/addons/botmod/bin/linuxsteamrt64/botmod.so release/
+          cp dist/linux/addons/metamod/botmod.vdf release/
+          cp dist/linux/addons/botmod/gamedata.ini release/
+          cd release
+          sha256sum botmod-linuxsteamrt64.zip botmod.so botmod.vdf gamedata.ini > SHA256SUMS
+
+      - name: Upload build downloads
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: botmod-linuxsteamrt64
+          path: release/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    needs: build
+    if: needs.build.outputs.tag != '' && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: botmod-linuxsteamrt64
+          path: release
+
+      - name: Verify downloaded files
+        working-directory: release
+        run: sha256sum --check SHA256SUMS
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.build.outputs.version }}
+          RELEASE_TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          cat > release-notes.md <<'NOTES'
+          Download **botmod-linuxsteamrt64.zip** and extract its `addons` folder into the server's `game/csgo` directory, then restart the server.
+
+          Individual files are also available:
+          - `botmod.so` → `game/csgo/addons/botmod/bin/linuxsteamrt64/botmod.so`
+          - `botmod.vdf` → `game/csgo/addons/metamod/botmod.vdf`
+          - `gamedata.ini` → `game/csgo/addons/botmod/gamedata.ini` (required)
+
+          Requires Linux x86-64, glibc 2.38+, and Metamod plugin API 17. The ZIP includes documentation and dependency license notices. `SHA256SUMS` covers all four downloads.
+          NOTES
+          if draft=$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft); then
+            if [ "$draft" != true ]; then
+              echo "Release $RELEASE_TAG is already published; leaving its downloads unchanged."
+              exit 0
+            fi
+          else
+            gh release create "$RELEASE_TAG" --verify-tag --draft \
+              --title "Botmod $VERSION" --notes-file release-notes.md
+          fi
+          gh release upload "$RELEASE_TAG" release/* --clobber
+          gh release edit "$RELEASE_TAG" --draft=false

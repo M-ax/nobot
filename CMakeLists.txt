@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(botmod VERSION 1.0.1 LANGUAGES C CXX)
+project(botmod VERSION 1.0.2 LANGUAGES C CXX)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 

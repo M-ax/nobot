@@ -7,10 +7,29 @@
 namespace botmod {
 
 constexpr std::uint32_t kFakeClient = 1u << 8;
+constexpr std::uint32_t kBot = 1u << 4;
 // A display-only ID, never used for authentication or written to engine clients.
 constexpr std::uint64_t kDisplayIdBase = 0x01100001F0000000ULL;
 
 std::string_view WithoutBotPrefix(std::string_view name);
+
+// Pawn bot state is separate from the controller's fake-client state.
+class PawnDisplayOverride {
+public:
+    explicit PawnDisplayOverride(std::uint32_t& flags) : flags_(flags), oldFlags_(flags)
+    {
+        flags_ &= ~kBot;
+    }
+    ~PawnDisplayOverride() { if (active_) flags_ = oldFlags_; }
+    PawnDisplayOverride(const PawnDisplayOverride&) = delete;
+    PawnDisplayOverride& operator=(const PawnDisplayOverride&) = delete;
+    void Abandon() { active_ = false; }
+
+private:
+    std::uint32_t& flags_;
+    std::uint32_t oldFlags_;
+    bool active_ = true;
+};
 
 // Applies only inside PackEntities. Destruction restores every byte we changed.
 class DisplayOverride {

@@ -79,6 +79,16 @@ CEntityInstance* GetEntity(CEntitySystem* system, int index)
     return identity.m_pInstance;
 }
 
+CEntityInstance* GetPawn(CEntitySystem* system, CEntityInstance* controller, Field field)
+{
+    const auto handle = At<CEntityHandle>(controller, field);
+    auto* pawn = GetEntity(system, handle.GetEntryIndex());
+    if (!pawn || pawn->GetRefEHandle() != handle ||
+        std::strcmp(pawn->GetClassname(), "player") != 0)
+        return nullptr;
+    return pawn;
+}
+
 class Botmod final : public ISmmPlugin {
 public:
     bool Load(PluginId id, ISmmAPI* ismm, char* error, size_t maxlen, bool late) override;
@@ -94,7 +104,7 @@ public:
     const char* GetDescription() override { return "Removes BOT name prefixes in the in-game player list"; }
     const char* GetURL() override { return ""; }
     const char* GetLicense() override { return "MIT"; }
-    const char* GetVersion() override { return "1.0.1"; }
+    const char* GetVersion() override { return "1.0.2"; }
     const char* GetDate() override { return __DATE__; }
     const char* GetLogTag() override { return "BOTMOD"; }
 
@@ -111,24 +121,32 @@ private:
     }
     void Restore();
     void MarkDisplayChanged(CEntityInstance* entity) const;
+    void OverridePawn(CEntityInstance* pawn);
 
     void* resources_ = nullptr;
     Field flags_{};
     Field steamId_{};
     Field name_{};
     Field hltv_{};
+    Field pawn_{};
+    Field playerPawn_{};
     int entitySystemOffset_ = -1;
     SafetyHookInline packHook_;
     std::recursive_mutex packingMutex_;
     std::atomic<unsigned int> packingDepth_{0};
     bool reported_ = false;
+    bool reportedPawns_ = false;
 
+    template<typename Override>
     struct Snapshot {
         CEntityInstance* entity = nullptr;
         CEntityHandle handle;
-        std::optional<botmod::DisplayOverride> display;
+        std::optional<Override> display;
     };
-    std::array<Snapshot, kMaxPlayers> snapshots_;
+    std::array<Snapshot<botmod::DisplayOverride>, kMaxPlayers> snapshots_;
+    // Active and playing pawns can differ when a controller is spectating.
+    std::array<Snapshot<botmod::PawnDisplayOverride>, kMaxPlayers * 2> pawnSnapshots_;
+    std::size_t pawnCount_ = 0;
 };
 
 Botmod g_Botmod;
@@ -149,6 +167,8 @@ bool Botmod::Load(PluginId id, ISmmAPI* ismm, char* error, size_t maxlen, bool /
         steamId_ = FindField(scope, "CBasePlayerController", "m_steamID", sizeof(std::uint64_t));
         name_ = FindField(scope, "CBasePlayerController", "m_iszPlayerName", 128);
         hltv_ = FindField(scope, "CBasePlayerController", "m_bIsHLTV", sizeof(bool));
+        pawn_ = FindField(scope, "CBasePlayerController", "m_hPawn", sizeof(CEntityHandle));
+        playerPawn_ = FindField(scope, "CCSPlayerController", "m_hPlayerPawn", sizeof(CEntityHandle));
 
         const auto path = std::string(ismm->GetBaseDir()) + "/addons/botmod/gamedata.ini";
         std::ifstream data(path);
@@ -183,8 +203,8 @@ bool Botmod::Load(PluginId id, ISmmAPI* ismm, char* error, size_t maxlen, bool /
         packHook_ = std::move(*hook);
         if (!packHook_.enable())
             throw std::runtime_error("Could not enable the PackEntities hook");
-        META_CONPRINTF("[Botmod] Loaded (Metamod API 17). Snapshot hook ready; schema flags=%d, SteamID=%d, name=%d.\n",
-                       flags_.offset, steamId_.offset, name_.offset);
+        META_CONPRINTF("[Botmod] Loaded 1.0.2 (Metamod API 17). Snapshot hook ready; schema flags=%d, SteamID=%d, name=%d, pawn=%d, playerPawn=%d.\n",
+                       flags_.offset, steamId_.offset, name_.offset, pawn_.offset, playerPawn_.offset);
         return true;
     } catch (const std::exception& exception) {
         packHook_.reset();
@@ -208,6 +228,18 @@ void Botmod::PackEntities(void* server, void* snapshot, int count, void* clients
         ~RestoreOnExit() { g_Botmod.PackPost(); }
     } restore;
     g_Botmod.packHook_.call<void>(server, snapshot, count, clients, transmit);
+}
+
+void Botmod::OverridePawn(CEntityInstance* pawn)
+{
+    if (!pawn || !(At<std::uint32_t>(pawn, flags_) & botmod::kBot))
+        return;
+    // A pawn already captured through another handle has FL_BOT cleared.
+    auto& snapshot = pawnSnapshots_[pawnCount_++];
+    snapshot.entity = pawn;
+    snapshot.handle = pawn->GetRefEHandle();
+    snapshot.display.emplace(At<std::uint32_t>(pawn, flags_));
+    pawn->NetworkStateChanged(NetworkStateChangedData(static_cast<uint32>(flags_.offset)));
 }
 
 void Botmod::PackPre()
@@ -246,17 +278,35 @@ void Botmod::PackPre()
         snapshot.handle = controller->GetRefEHandle();
         snapshot.display.emplace(flags, steamId, &At<char>(controller, name_), name_.size, displayId);
         MarkDisplayChanged(controller);
+        OverridePawn(GetPawn(system, controller, pawn_));
+        OverridePawn(GetPawn(system, controller, playerPawn_));
         ++changed;
     }
     if (changed && !reported_) {
         META_CONPRINTF("[Botmod] Applied display overrides to %d bot(s); native state restores after packing.\n", changed);
         reported_ = true;
     }
+    if (pawnCount_ && !reportedPawns_) {
+        META_CONPRINTF("[Botmod] Applied FL_BOT display overrides to %d pawn(s); native flags restore after packing.\n",
+                       static_cast<int>(pawnCount_));
+        reportedPawns_ = true;
+    }
 }
 
 void Botmod::Restore()
 {
     auto* system = EntitySystem();
+    // Validate pawns independently: death/respawn can replace a pawn without
+    // replacing its controller, and a controller can disappear first.
+    for (std::size_t i = 0; i < pawnCount_; ++i) {
+        auto& snapshot = pawnSnapshots_[i];
+        auto* current = GetEntity(system, snapshot.handle.GetEntryIndex());
+        if (current != snapshot.entity || !current || current->GetRefEHandle() != snapshot.handle)
+            snapshot.display->Abandon();
+        snapshot.display.reset();
+        snapshot.entity = nullptr;
+    }
+    pawnCount_ = 0;
     for (int slot = 0; slot < kMaxPlayers; ++slot) {
         auto& snapshot = snapshots_[slot];
         if (!snapshot.display)
@@ -294,11 +344,19 @@ bool Botmod::Unload(char* error, size_t maxlen)
     for (int index = 1; index <= kMaxPlayers; ++index) {
         auto* controller = GetEntity(system, index);
         if (controller && std::strcmp(controller->GetClassname(), "cs_player_controller") == 0 &&
-            (At<std::uint32_t>(controller, flags_) & botmod::kFakeClient))
+            !At<bool>(controller, hltv_) &&
+            (At<std::uint32_t>(controller, flags_) & botmod::kFakeClient)) {
             MarkDisplayChanged(controller);
+            for (const auto field : {pawn_, playerPawn_}) {
+                auto* pawn = GetPawn(system, controller, field);
+                if (pawn)
+                    pawn->NetworkStateChanged(NetworkStateChangedData(static_cast<uint32>(flags_.offset)));
+            }
+        }
     }
     resources_ = nullptr;
     reported_ = false;
+    reportedPawns_ = false;
     META_CONPRINTF("[Botmod] Unloaded; native bot display restored.\n");
     return true;
 }
