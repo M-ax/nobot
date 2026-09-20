@@ -54,7 +54,7 @@ void* FindUniqueEnginePattern(const std::vector<int>& pattern)
     for (unsigned int i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
         if (!(sections[i].Characteristics & IMAGE_SCN_MEM_EXECUTE))
             continue;
-        // Other plugins and previously removed KHook detours may have patched
+        // Other plugins and previously removed detours may have patched
         // the entry point in memory. Scan the original file and translate RVAs.
         SearchSection(image, sections[i].PointerToRawData,
                       (std::min)(sections[i].SizeOfRawData, sections[i].Misc.VirtualSize),

@@ -1,6 +1,7 @@
 #include "display.h"
 #include "pattern.h"
 
+#include <safetyhook.hpp>
 #include <ISmmPlugin.h>
 #include <entity2/entityinstance.h>
 #include <entity2/entitysystem.h>
@@ -12,13 +13,13 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
-#include <memory>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
 
 PLUGIN_GLOBALVARS();
+static_assert(METAMOD_PLAPI_VERSION == 17, "Botmod must use the real Metamod API 17 headers");
 
 namespace {
 
@@ -78,13 +79,6 @@ CEntityInstance* GetEntity(CEntitySystem* system, int index)
     return identity.m_pInstance;
 }
 
-using PackHookBase = KHook::Function<void, void*, void*, int, void*, void*>;
-class PackHook : public PackHookBase {
-public:
-    using PackHookBase::PackHookBase;
-    bool Installed() const { return _associated_hook_id != KHook::INVALID_HOOK; }
-};
-
 class Botmod final : public ISmmPlugin {
 public:
     bool Load(PluginId id, ISmmAPI* ismm, char* error, size_t maxlen, bool late) override;
@@ -100,14 +94,14 @@ public:
     const char* GetDescription() override { return "Removes BOT name prefixes in the in-game player list"; }
     const char* GetURL() override { return ""; }
     const char* GetLicense() override { return "MIT"; }
-    const char* GetVersion() override { return "1.0.0"; }
+    const char* GetVersion() override { return "1.0.1"; }
     const char* GetDate() override { return __DATE__; }
     const char* GetLogTag() override { return "BOTMOD"; }
 
-    KHook::Return<void> PackPre(void*, void*, int, void*, void*);
-    KHook::Return<void> PackPost(void*, void*, int, void*, void*);
-
 private:
+    static void PackEntities(void* server, void* snapshot, int count, void* clients, void* transmit);
+    void PackPre();
+    void PackPost();
     CEntitySystem* EntitySystem() const
     {
         CEntitySystem* result = nullptr;
@@ -124,7 +118,7 @@ private:
     Field name_{};
     Field hltv_{};
     int entitySystemOffset_ = -1;
-    std::unique_ptr<PackHook> packHook_;
+    SafetyHookInline packHook_;
     std::recursive_mutex packingMutex_;
     std::atomic<unsigned int> packingDepth_{0};
     bool reported_ = false;
@@ -143,8 +137,6 @@ bool Botmod::Load(PluginId id, ISmmAPI* ismm, char* error, size_t maxlen, bool /
 {
     PLUGIN_SAVEVARS();
     try {
-        if (!KHook::__exported__khook)
-            throw std::runtime_error("Metamod:Source 2.0 with KHook is required");
         auto factory = ismm->GetEngineFactory();
         resources_ = factory(GAMERESOURCESERVICESERVER_INTERFACE_VERSION, nullptr);
         auto* schema = static_cast<CSchemaSystem*>(factory(SCHEMASYSTEM_INTERFACE_VERSION, nullptr));
@@ -183,11 +175,15 @@ bool Botmod::Load(PluginId id, ISmmAPI* ismm, char* error, size_t maxlen, bool /
         if (entitySystemOffset_ < 0 || entitySystemOffset_ > 1024 || entitySystemOffset_ % alignof(void*) != 0)
             throw std::runtime_error("Invalid or missing entity_system_offset");
         auto* target = botmod::FindUniqueEnginePattern(botmod::ParsePattern(signature));
-        packHook_ = std::make_unique<PackHook>(this, &Botmod::PackPre, &Botmod::PackPost);
-        packHook_->Configure(target);
-        if (!packHook_->Installed())
+        // Publish the trampoline before enabling callbacks, including for late loads.
+        auto hook = safetyhook::InlineHook::create(target, &Botmod::PackEntities,
+                                                 safetyhook::InlineHook::StartDisabled);
+        if (!hook)
             throw std::runtime_error("Could not install the PackEntities hook");
-        META_CONPRINTF("[Botmod] Loaded. Snapshot hook ready; schema flags=%d, SteamID=%d, name=%d.\n",
+        packHook_ = std::move(*hook);
+        if (!packHook_.enable())
+            throw std::runtime_error("Could not enable the PackEntities hook");
+        META_CONPRINTF("[Botmod] Loaded (Metamod API 17). Snapshot hook ready; schema flags=%d, SteamID=%d, name=%d.\n",
                        flags_.offset, steamId_.offset, name_.offset);
         return true;
     } catch (const std::exception& exception) {
@@ -205,11 +201,20 @@ void Botmod::MarkDisplayChanged(CEntityInstance* entity) const
         static_cast<uint32>(name_.offset)});
 }
 
-KHook::Return<void> Botmod::PackPre(void*, void*, int, void*, void*)
+void Botmod::PackEntities(void* server, void* snapshot, int count, void* clients, void* transmit)
+{
+    g_Botmod.PackPre();
+    struct RestoreOnExit {
+        ~RestoreOnExit() { g_Botmod.PackPost(); }
+    } restore;
+    g_Botmod.packHook_.call<void>(server, snapshot, count, clients, transmit);
+}
+
+void Botmod::PackPre()
 {
     packingMutex_.lock();
     if (packingDepth_.fetch_add(1) != 0)
-        return {KHook::Action::Ignore};
+        return;
 
     auto* system = EntitySystem();
     int changed = 0;
@@ -247,7 +252,6 @@ KHook::Return<void> Botmod::PackPre(void*, void*, int, void*, void*)
         META_CONPRINTF("[Botmod] Applied display overrides to %d bot(s); native state restores after packing.\n", changed);
         reported_ = true;
     }
-    return {KHook::Action::Ignore};
 }
 
 void Botmod::Restore()
@@ -266,12 +270,11 @@ void Botmod::Restore()
     }
 }
 
-KHook::Return<void> Botmod::PackPost(void*, void*, int, void*, void*)
+void Botmod::PackPost()
 {
     if (packingDepth_.fetch_sub(1) == 1)
         Restore();
     packingMutex_.unlock();
-    return {KHook::Action::Ignore};
 }
 
 bool Botmod::Unload(char* error, size_t maxlen)
@@ -280,7 +283,10 @@ bool Botmod::Unload(char* error, size_t maxlen)
         std::snprintf(error, maxlen, "A network snapshot is in progress; retry unloading between frames");
         return false;
     }
-    // KHook waits for active callbacks. Do not hold packingMutex_ here.
+    if (!packHook_.disable()) {
+        std::snprintf(error, maxlen, "Could not disable the PackEntities hook; plugin remains loaded");
+        return false;
+    }
     packHook_.reset();
     Restore();
     // Force the original values back into the next outgoing snapshot.

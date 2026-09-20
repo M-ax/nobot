@@ -1,11 +1,14 @@
-cmake_minimum_required(VERSION 3.24)
-project(botmod VERSION 1.0.0 LANGUAGES CXX)
+cmake_minimum_required(VERSION 3.28)
+project(botmod VERSION 1.0.1 LANGUAGES C CXX)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 include(CTest)
 option(BOTMOD_BUILD_PLUGIN "Build the CS2 Metamod plugin" ON)
-set(MMSOURCE "${CMAKE_CURRENT_SOURCE_DIR}/.deps/metamod-source" CACHE PATH "Metamod:Source 2.0 checkout")
+set(MMSOURCE "${CMAKE_CURRENT_SOURCE_DIR}/.deps/metamod-source-api17" CACHE PATH "Metamod:Source plugin API 17 checkout")
 set(HL2SDK "${CMAKE_CURRENT_SOURCE_DIR}/.deps/hl2sdk-cs2" CACHE PATH "HL2SDK cs2 checkout")
+set(SAFETYHOOK "${CMAKE_CURRENT_SOURCE_DIR}/.deps/safetyhook" CACHE PATH "SafetyHook checkout")
+set(ZYDIS "${CMAKE_CURRENT_SOURCE_DIR}/.deps/zydis" CACHE PATH "Zydis checkout")
 
 add_library(botmod_core STATIC src/display.cpp src/pattern.cpp)
 target_include_directories(botmod_core PUBLIC src)
@@ -19,11 +22,25 @@ if(BOTMOD_BUILD_PLUGIN)
     if(WIN32 AND NOT MSVC)
         message(FATAL_ERROR "Use Visual Studio/MSVC on Windows to match the CS2 ABI")
     endif()
-    foreach(header "${MMSOURCE}/core/ISmmPlugin.h" "${MMSOURCE}/third_party/khook/include/khook.hpp" "${HL2SDK}/public/eiface.h")
+    foreach(header "${MMSOURCE}/core/ISmmPlugin.h" "${SAFETYHOOK}/include/safetyhook.hpp"
+        "${ZYDIS}/include/Zydis/Zydis.h" "${HL2SDK}/public/eiface.h")
         if(NOT EXISTS "${header}")
             message(FATAL_ERROR "Missing ${header}. Run scripts/fetch-deps.py first.")
         endif()
     endforeach()
+    # Reject cached API 18 headers before producing another incompatible binary.
+    file(STRINGS "${MMSOURCE}/core/ISmmPluginExt.h" metamod_api REGEX "^#define METAMOD_PLAPI_VERSION")
+    if(NOT metamod_api MATCHES "METAMOD_PLAPI_VERSION[ \t]+17[ \t]")
+        message(FATAL_ERROR "Botmod requires plugin API 17 headers. Set MMSOURCE to .deps/metamod-source-api17 or use a fresh build directory.")
+    endif()
+    set(BUILD_SHARED_LIBS OFF)
+    # Supply pinned local sources to SafetyHook's FetchContent declaration.
+    set(FETCHCONTENT_SOURCE_DIR_ZYDIS "${ZYDIS}")
+    add_subdirectory("${SAFETYHOOK}" "safetyhook" EXCLUDE_FROM_ALL)
+    if(NOT MSVC)
+        target_compile_definitions(safetyhook PUBLIC _GLIBCXX_USE_CXX11_ABI=0)
+        target_compile_options(safetyhook PRIVATE -fvisibility=hidden)
+    endif()
     if(WIN32)
         set(PROTOC "${HL2SDK}/devtools/bin/protoc.exe")
     else()
@@ -38,11 +55,11 @@ if(BOTMOD_BUILD_PLUGIN)
         DEPENDS "${HL2SDK}/common/network_connection.proto" VERBATIM)
     add_library(botmod SHARED src/plugin.cpp src/module.cpp
         "${CMAKE_CURRENT_BINARY_DIR}/generated/network_connection.pb.h")
-    target_link_libraries(botmod PRIVATE botmod_core)
+    target_link_libraries(botmod PRIVATE botmod_core safetyhook::safetyhook)
     target_include_directories(botmod SYSTEM PRIVATE
         "${CMAKE_CURRENT_BINARY_DIR}/generated"
         "${MMSOURCE}/core" "${MMSOURCE}/public"
-        "${MMSOURCE}/third_party/khook/include"
+        "${MMSOURCE}/core/sourcehook"
         "${HL2SDK}/public" "${HL2SDK}/public/engine"
         "${HL2SDK}/public/tier0" "${HL2SDK}/public/tier1"
         "${HL2SDK}/public/mathlib" "${HL2SDK}/public/entity2"
@@ -76,6 +93,9 @@ if(BOTMOD_BUILD_PLUGIN)
     install(FILES "${CMAKE_CURRENT_BINARY_DIR}/botmod.vdf" DESTINATION addons/metamod)
     install(FILES addons/botmod/gamedata.ini DESTINATION addons/botmod)
     install(FILES README.md TESTING.md LICENSE DESTINATION addons/botmod)
+    install(FILES "${SAFETYHOOK}/LICENSE" DESTINATION addons/botmod/licenses RENAME SafetyHook.txt)
+    install(FILES "${ZYDIS}/LICENSE" DESTINATION addons/botmod/licenses RENAME Zydis.txt)
+    install(FILES "${ZYDIS}/dependencies/zycore/LICENSE" DESTINATION addons/botmod/licenses RENAME Zycore.txt)
     set(CPACK_GENERATOR ZIP)
     set(CPACK_PACKAGE_FILE_NAME "botmod-${PROJECT_VERSION}-${BOTMOD_PLATFORM}")
     set(CPACK_INCLUDE_TOPLEVEL_DIRECTORY OFF)
@@ -86,4 +106,9 @@ if(BUILD_TESTING)
     add_executable(botmod_tests tests/core_tests.cpp)
     target_link_libraries(botmod_tests PRIVATE botmod_core)
     add_test(NAME botmod_core COMMAND botmod_tests)
+    if(BOTMOD_BUILD_PLUGIN)
+        add_executable(botmod_detour_tests tests/detour_tests.cpp)
+        target_link_libraries(botmod_detour_tests PRIVATE safetyhook::safetyhook)
+        add_test(NAME botmod_detour COMMAND botmod_detour_tests)
+    endif()
 endif()
