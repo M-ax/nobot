@@ -1,4 +1,5 @@
 #include "display.h"
+#include "client_display.h"
 #include "pattern.h"
 
 #include <array>
@@ -27,6 +28,47 @@ int main()
     Check(WithoutBotPrefix("BOTany") == "BOTany", "ordinary names preserved");
     Check(WithoutBotPrefix("Alice [BOT]") == "Alice [BOT]", "suffix preserved");
     Check(WithoutBotPrefix("[BOT] ") == "[BOT] ", "empty result rejected");
+
+    // Reproduce the engine's unaligned SteamID layout. Entity-only tests used
+    // to pass while CMsgPlayerInfo still advertised fakeplayer=true.
+    const ClientLayout layout{584, 72, 80, 88, 96, 160, 168, 171, 179, 322};
+    Check(layout.Valid(), "current engine client layout accepted");
+    Check(!ClientLayout{}.Valid(), "missing gamedata rejected");
+    auto overlapping = layout;
+    overlapping.steamIdMirror = layout.steamId + 1;
+    Check(!overlapping.Valid(), "overlapping client fields rejected");
+    std::array<unsigned char, 384> client;
+    client.fill(0x5a);
+    client[layout.fake] = 1;
+    client[layout.connection] = 0x28; // Preserve unrelated connection bits.
+    const auto nativeClient = client;
+    {
+        ClientDisplayOverride info(client.data(), layout, kDisplayIdBase + 2);
+        Check(client[layout.fake] == 0 && client[layout.connection] == 0x21,
+              "player-info serialization sees both fake-client markers cleared");
+        Check(ReadClient<std::uint64_t>(client.data(), layout.steamId) == kDisplayIdBase + 2 &&
+              ReadClient<std::uint64_t>(client.data(), layout.steamIdMirror) == kDisplayIdBase + 2,
+              "both unaligned engine identities match the controller display ID");
+        {
+            ClientDisplayOverride nested(client.data(), layout, kDisplayIdBase + 3);
+        }
+        Check(client[layout.fake] == 0 &&
+              ReadClient<std::uint64_t>(client.data(), layout.steamId) == kDisplayIdBase + 2,
+              "nested userinfo restores the outer identity");
+    }
+    Check(client == nativeClient, "engine identity restored byte-for-byte before VStrike renames");
+    try {
+        ClientDisplayOverride info(client.data(), layout, kDisplayIdBase + 2);
+        throw std::runtime_error("userinfo failed");
+    } catch (const std::exception&) {}
+    Check(client == nativeClient, "engine identity restored on exceptional exit");
+    {
+        ClientDisplayOverride info(client.data(), layout, kDisplayIdBase + 2);
+        info.Abandon();
+        client.fill(0x42);
+    }
+    Check(client[layout.fake] == 0x42 && client[layout.steamId] == 0x42,
+          "reused client is not overwritten during restoration");
 
     std::uint32_t flags = kFakeClient | 0x80200001u;
     const auto originalFlags = flags;

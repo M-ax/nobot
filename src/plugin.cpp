@@ -1,4 +1,5 @@
 #include "display.h"
+#include "client_display.h"
 #include "pattern.h"
 
 #include <safetyhook.hpp>
@@ -6,6 +7,7 @@
 #include <entity2/entityinstance.h>
 #include <entity2/entitysystem.h>
 #include <schemasystem/schemasystem.h>
+#include <iserver.h>
 
 #include <array>
 #include <atomic>
@@ -89,10 +91,11 @@ CEntityInstance* GetPawn(CEntitySystem* system, CEntityInstance* controller, Fie
     return pawn;
 }
 
-class Botmod final : public ISmmPlugin {
+class Botmod final : public ISmmPlugin, public IMetamodListener {
 public:
     bool Load(PluginId id, ISmmAPI* ismm, char* error, size_t maxlen, bool late) override;
     bool Unload(char* error, size_t maxlen) override;
+    void OnLevelInit(const char*, const char*, const char*, const char*, bool, bool) override;
     bool Pause(char* error, size_t maxlen) override
     {
         std::snprintf(error, maxlen, "Unload Botmod to restore the native display");
@@ -104,7 +107,7 @@ public:
     const char* GetDescription() override { return "Removes BOT name prefixes in the in-game player list"; }
     const char* GetURL() override { return ""; }
     const char* GetLicense() override { return "MIT"; }
-    const char* GetVersion() override { return "1.0.2"; }
+    const char* GetVersion() override { return "1.1.0"; }
     const char* GetDate() override { return __DATE__; }
     const char* GetLogTag() override { return "BOTMOD"; }
 
@@ -122,8 +125,20 @@ private:
     void Restore();
     void MarkDisplayChanged(CEntityInstance* entity) const;
     void OverridePawn(CEntityInstance* pawn);
+    static void UserInfoChanged(CNetworkGameServerBase* server, CPlayerSlot slot);
+    bool EnsureUserInfoHook();
+    void* GetClient(CNetworkGameServerBase* server, int slot) const;
+    std::uint64_t DisplayId(int slot, CEntityInstance* controller) const;
+    void RefreshUserInfo();
 
     void* resources_ = nullptr;
+    INetworkServerService* network_ = nullptr;
+    botmod::ClientLayout clientLayout_;
+    SafetyHookInline userInfoHook_;
+    std::atomic<unsigned int> userInfoDepth_{0};
+    bool refreshUserInfo_ = true;
+    bool reportedUserInfo_ = false;
+    bool reportedUserInfoFailure_ = false;
     Field flags_{};
     Field steamId_{};
     Field name_{};
@@ -154,11 +169,14 @@ Botmod g_Botmod;
 bool Botmod::Load(PluginId id, ISmmAPI* ismm, char* error, size_t maxlen, bool /*late*/)
 {
     PLUGIN_SAVEVARS();
+    clientLayout_ = {};
+    entitySystemOffset_ = -1;
     try {
         auto factory = ismm->GetEngineFactory();
         resources_ = factory(GAMERESOURCESERVICESERVER_INTERFACE_VERSION, nullptr);
+        network_ = static_cast<INetworkServerService*>(factory(NETWORKSERVERSERVICE_INTERFACE_VERSION, nullptr));
         auto* schema = static_cast<CSchemaSystem*>(factory(SCHEMASYSTEM_INTERFACE_VERSION, nullptr));
-        if (!resources_ || !schema)
+        if (!resources_ || !schema || !network_)
             throw std::runtime_error("CS2 game resource or schema interface unavailable");
         auto* scope = schema->FindTypeScopeForModule(kServerModule);
         if (!scope)
@@ -185,15 +203,30 @@ bool Botmod::Load(PluginId id, ISmmAPI* ismm, char* error, size_t maxlen, bool /
             const auto value = line.substr(separator + 1);
             if (key == kPlatform)
                 signature = value;
-            else if (key == "entity_system_offset") {
-                const auto parsed = std::from_chars(value.data(), value.data() + value.size(), entitySystemOffset_);
+            else {
+                int* offset = nullptr;
+                if (key == "entity_system_offset") offset = &entitySystemOffset_;
+                else if (key == "client_list_offset") offset = &clientLayout_.clients;
+                else if (key == "client_slot_offset") offset = &clientLayout_.slot;
+                else if (key == "client_server_offset") offset = &clientLayout_.server;
+                else if (key == "client_channel_offset") offset = &clientLayout_.channel;
+                else if (key == "client_connection_offset") offset = &clientLayout_.connection;
+                else if (key == "client_fake_offset") offset = &clientLayout_.fake;
+                else if (key == "client_userid_offset") offset = &clientLayout_.userId;
+                else if (key == "client_steamid_offset") offset = &clientLayout_.steamId;
+                else if (key == "client_steamid_mirror_offset") offset = &clientLayout_.steamIdMirror;
+                else if (key == "client_hltv_offset") offset = &clientLayout_.hltv;
+                if (!offset) continue;
+                const auto parsed = std::from_chars(value.data(), value.data() + value.size(), *offset);
                 if (parsed.ec != std::errc{} ||
                     value.find_first_not_of(" \t\r", parsed.ptr - value.data()) != std::string::npos)
-                    throw std::runtime_error("Invalid entity_system_offset");
+                    throw std::runtime_error("Invalid gamedata offset: " + key);
             }
         }
         if (entitySystemOffset_ < 0 || entitySystemOffset_ > 1024 || entitySystemOffset_ % alignof(void*) != 0)
             throw std::runtime_error("Invalid or missing entity_system_offset");
+        if (!clientLayout_.Valid())
+            throw std::runtime_error("Invalid or missing engine client offsets; install the 1.1.0 gamedata.ini");
         auto* target = botmod::FindUniqueEnginePattern(botmod::ParsePattern(signature));
         // Publish the trampoline before enabling callbacks, including for late loads.
         auto hook = safetyhook::InlineHook::create(target, &Botmod::PackEntities,
@@ -203,15 +236,128 @@ bool Botmod::Load(PluginId id, ISmmAPI* ismm, char* error, size_t maxlen, bool /
         packHook_ = std::move(*hook);
         if (!packHook_.enable())
             throw std::runtime_error("Could not enable the PackEntities hook");
-        META_CONPRINTF("[Botmod] Loaded 1.0.2 (Metamod API 17). Snapshot hook ready; schema flags=%d, SteamID=%d, name=%d, pawn=%d, playerPawn=%d.\n",
+        if (!EnsureUserInfoHook())
+            throw std::runtime_error("Could not install player-info hooks");
+        ismm->AddListener(this, this);
+        META_CONPRINTF("[Botmod] Loaded 1.1.0 (Metamod API 17). Engine player-info and snapshot overrides; schema flags=%d, SteamID=%d, name=%d, pawn=%d, playerPawn=%d.\n",
                        flags_.offset, steamId_.offset, name_.offset, pawn_.offset, playerPawn_.offset);
         return true;
     } catch (const std::exception& exception) {
+        userInfoHook_.reset();
         packHook_.reset();
         resources_ = nullptr;
         std::snprintf(error, maxlen, "%s", exception.what());
         return false;
     }
+}
+
+bool Botmod::EnsureUserInfoHook()
+{
+    if (userInfoHook_) return true;
+    auto* server = network_->GetIGameServer();
+    // Startup can precede server creation. LevelInit retries, and the first
+    // snapshot refreshes any player-info records created before installation.
+    if (!server) return true;
+    auto* target = SourceHook::GetOrigVfnPtrEntry(server, &CNetworkGameServerBase::UserInfoChanged, g_SHPtr);
+    auto hook = safetyhook::InlineHook::create(target, &Botmod::UserInfoChanged,
+                                              safetyhook::InlineHook::StartDisabled);
+    if (!hook) return false;
+    userInfoHook_ = std::move(*hook);
+    if (!userInfoHook_.enable()) {
+        userInfoHook_.reset();
+        return false;
+    }
+    META_CONPRINTF("[Botmod] UserInfoChanged hook ready (engine fake-player flag and both SteamID fields).\n");
+    return true;
+}
+
+void* Botmod::GetClient(CNetworkGameServerBase* server, int slot) const
+{
+    if (!server || slot < 0 || slot >= kMaxPlayers) return nullptr;
+    const auto* clients = reinterpret_cast<const CUtlVector<void*>*>(
+        reinterpret_cast<const unsigned char*>(server) + clientLayout_.clients);
+    if (clients->Count() < 0 || clients->Count() > 256 || slot >= clients->Count() || !clients->Base())
+        return nullptr;
+    auto* client = clients->Element(slot);
+    if (!client || botmod::ReadClient<int>(client, clientLayout_.slot) != slot ||
+        botmod::ReadClient<void*>(client, clientLayout_.server) != server ||
+        botmod::ReadClient<std::uint8_t>(client, clientLayout_.fake) > 1 ||
+        botmod::ReadClient<std::uint8_t>(client, clientLayout_.hltv) > 1)
+        return nullptr;
+    return client;
+}
+
+std::uint64_t Botmod::DisplayId(int slot, CEntityInstance* controller) const
+{
+    const auto nativeId = controller ? At<std::uint64_t>(controller, steamId_) : 0;
+    const auto candidate = nativeId ? nativeId : botmod::kDisplayIdBase + slot + 1;
+    auto* system = EntitySystem();
+    // Preserve custom identities, but never publish a duplicate scoreboard ID.
+    for (int peerSlot = 0; peerSlot < kMaxPlayers; ++peerSlot) {
+        auto* peer = GetEntity(system, peerSlot + 1);
+        if (peerSlot != slot && peer && std::strcmp(peer->GetClassname(), "cs_player_controller") == 0 &&
+            At<std::uint64_t>(peer, steamId_) == candidate)
+            return 0;
+    }
+    return candidate;
+}
+
+void Botmod::UserInfoChanged(CNetworkGameServerBase* server, CPlayerSlot playerSlot)
+{
+    auto& self = g_Botmod;
+    std::lock_guard lock(self.packingMutex_);
+    ++self.userInfoDepth_;
+    struct DepthOnExit {
+        ~DepthOnExit() { --g_Botmod.userInfoDepth_; }
+    } depth;
+    const int slot = playerSlot.Get();
+    auto* client = self.GetClient(server, slot);
+    const auto& layout = self.clientLayout_;
+    std::optional<botmod::ClientDisplayOverride> display;
+    std::uint16_t userId = 0;
+    if (client && botmod::ReadClient<std::uint8_t>(client, layout.fake) == 1 &&
+        !botmod::ReadClient<std::uint8_t>(client, layout.hltv) &&
+        !botmod::ReadClient<void*>(client, layout.channel)) {
+        auto* controller = GetEntity(self.EntitySystem(), slot + 1);
+        if (controller && std::strcmp(controller->GetClassname(), "cs_player_controller") != 0)
+            controller = nullptr;
+        userId = botmod::ReadClient<std::uint16_t>(client, layout.userId);
+        const auto displayId = self.DisplayId(slot, controller);
+        if (displayId) display.emplace(client, layout, displayId);
+    }
+    // Original code serializes CMsgPlayerInfo and marks the userinfo table dirty.
+    // Hook the function itself, so internal (non-virtual) engine calls also pass
+    // here, including SetFakeClientConVar(name) from VStrikeIdentity.
+    self.userInfoHook_.call<void>(server, playerSlot);
+    if (display) {
+        if (self.GetClient(server, slot) != client ||
+            botmod::ReadClient<std::uint16_t>(client, layout.userId) != userId)
+            display->Abandon();
+        display.reset();
+        if (!self.reportedUserInfo_) {
+            META_CONPRINTF("[Botmod] Published bot player info with fakeplayer=false; native client state restored for VStrikeIdentity.\n");
+            self.reportedUserInfo_ = true;
+        }
+    }
+}
+
+void Botmod::RefreshUserInfo()
+{
+    auto* server = network_->GetIGameServer();
+    if (!server) return;
+    for (int slot = 0; slot < kMaxPlayers; ++slot) {
+        auto* client = GetClient(server, slot);
+        if (client && botmod::ReadClient<std::uint8_t>(client, clientLayout_.fake) == 1 &&
+            !botmod::ReadClient<std::uint8_t>(client, clientLayout_.hltv))
+            server->UserInfoChanged(CPlayerSlot(slot));
+    }
+}
+
+void Botmod::OnLevelInit(const char*, const char*, const char*, const char*, bool, bool)
+{
+    refreshUserInfo_ = true;
+    if (!EnsureUserInfoHook())
+        META_CONPRINTF("[Botmod] ERROR: Player-info hook unavailable during level initialization.\n");
 }
 
 void Botmod::MarkDisplayChanged(CEntityInstance* entity) const
@@ -248,6 +394,18 @@ void Botmod::PackPre()
     if (packingDepth_.fetch_add(1) != 0)
         return;
 
+    // Avoid sharing GameFrame/OnClientConnected hook managers with CSS. Its
+    // deferred VStrike commands must keep ticking across unload and map change.
+    if (!EnsureUserInfoHook()) {
+        if (!reportedUserInfoFailure_) {
+            META_CONPRINTF("[Botmod] ERROR: UserInfoChanged hook failed; BOT labels may remain.\n");
+            reportedUserInfoFailure_ = true;
+        }
+    } else if (userInfoHook_ && refreshUserInfo_) {
+        RefreshUserInfo();
+        refreshUserInfo_ = false;
+    }
+
     auto* system = EntitySystem();
     int changed = 0;
     for (int slot = 0; slot < kMaxPlayers; ++slot) {
@@ -259,20 +417,8 @@ void Botmod::PackPre()
         if (!(flags & botmod::kFakeClient))
             continue;
         auto& steamId = At<std::uint64_t>(controller, steamId_);
-        // Real Steam identities assigned by another plugin are left alone.
-        auto displayId = steamId ? steamId : botmod::kDisplayIdBase + slot + 1;
-        // Do not let a custom identity collide with a generated one.
-        bool collision = false;
-        for (int other = 0; other < kMaxPlayers; ++other) {
-            auto* peer = GetEntity(system, other + 1);
-            if (other != slot && peer && std::strcmp(peer->GetClassname(), "cs_player_controller") == 0 &&
-                At<std::uint64_t>(peer, steamId_) == displayId) {
-                collision = true;
-                break;
-            }
-        }
-        if (collision)
-            continue;
+        const auto displayId = DisplayId(slot, controller);
+        if (!displayId) continue;
         auto& snapshot = snapshots_[slot];
         snapshot.entity = controller;
         snapshot.handle = controller->GetRefEHandle();
@@ -329,7 +475,7 @@ void Botmod::PackPost()
 
 bool Botmod::Unload(char* error, size_t maxlen)
 {
-    if (packingDepth_.load() != 0) {
+    if (packingDepth_.load() != 0 || userInfoDepth_.load() != 0) {
         std::snprintf(error, maxlen, "A network snapshot is in progress; retry unloading between frames");
         return false;
     }
@@ -337,6 +483,12 @@ bool Botmod::Unload(char* error, size_t maxlen)
         std::snprintf(error, maxlen, "Could not disable the PackEntities hook; plugin remains loaded");
         return false;
     }
+    if (userInfoHook_ && !userInfoHook_.disable()) {
+        (void)packHook_.enable();
+        std::snprintf(error, maxlen, "Could not disable the player-info hook; plugin remains loaded");
+        return false;
+    }
+    userInfoHook_.reset();
     packHook_.reset();
     Restore();
     // Force the original values back into the next outgoing snapshot.
@@ -354,9 +506,13 @@ bool Botmod::Unload(char* error, size_t maxlen)
             }
         }
     }
+    RefreshUserInfo();
     resources_ = nullptr;
     reported_ = false;
     reportedPawns_ = false;
+    reportedUserInfo_ = false;
+    reportedUserInfoFailure_ = false;
+    refreshUserInfo_ = true;
     META_CONPRINTF("[Botmod] Unloaded; native bot display restored.\n");
     return true;
 }
