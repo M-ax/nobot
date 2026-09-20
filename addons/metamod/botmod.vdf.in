@@ -1,0 +1,5 @@
+"Metamod Plugin"
+{
+    "alias" "botmod"
+    "file"  "addons/botmod/bin/@BOTMOD_PLATFORM@/botmod"
+}
