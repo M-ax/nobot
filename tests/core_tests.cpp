@@ -1,6 +1,7 @@
 #include "display.h"
 #include "client_display.h"
 #include "pattern.h"
+#include "player_info.h"
 
 #include <array>
 #include <cstring>
@@ -21,6 +22,23 @@ void Check(bool condition, const char* message)
 int main()
 {
     using namespace botmod;
+    // Real protobuf field numbers, including unknown fields and embedded names.
+    const unsigned char playerInfo[] = {10, 3, 'B', 'o', 'b', 17, 1, 2, 3, 4, 5, 6, 7, 8,
+        33, 8, 7, 6, 5, 4, 3, 2, 1, 40, 0, 48, 1, 120, 42, 125, 0, 0, 0, 0};
+    auto published = ReadPlayerInfo(playerInfo, sizeof(playerInfo));
+    Check(published && published->xuid == 0x0807060504030201ULL &&
+          published->steamId == 0x0102030405060708ULL && !published->fake && published->hltv,
+          "published identity decoded with unknown fields skipped");
+    const unsigned char nativeInfo[] = {40, 1};
+    Check(ReadPlayerInfo(nativeInfo, sizeof(nativeInfo))->fake, "native fake-player record detected");
+    const unsigned char repeatedInfo[] = {40, 1, 40, 0};
+    Check(!ReadPlayerInfo(repeatedInfo, sizeof(repeatedInfo))->fake, "last protobuf value wins");
+    const unsigned char badLength[] = {10, 127, 'x'};
+    const unsigned char badWire[] = {42, 0};
+    const unsigned char badVarint[] = {40, 128, 128, 128, 128, 128, 128, 128, 128, 128, 2};
+    Check(!ReadPlayerInfo(nullptr, 0) && !ReadPlayerInfo(badLength, sizeof(badLength)) &&
+          !ReadPlayerInfo(badWire, sizeof(badWire)) && !ReadPlayerInfo(badVarint, sizeof(badVarint)) &&
+          !ReadPlayerInfo(playerInfo, 12), "unreadable protobuf is not reported as a successful override");
     Check(WithoutBotPrefix("[BOT] Bob") == "Bob", "bracketed prefix");
     Check(WithoutBotPrefix("BOT Bob") == "Bob", "native literal prefix");
     Check(WithoutBotPrefix("[BOT] [BOT] BOT Bob") == "Bob", "repeated prefixes");

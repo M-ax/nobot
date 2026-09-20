@@ -79,7 +79,7 @@ the full directory layout, required gamedata, and license notices.
 
 1. Use a CS2 Metamod build with **plugin interface version 17**, as reported by
    `meta version`, such as [2.0.0-dev+1411](https://github.com/alliedmodders/metamod-source/releases/tag/2.0.0.1411).
-   Keep your existing API 17 installation. Botmod 1.1.0 bundles its own detour
+   Keep your existing API 17 installation. Botmod bundles its own detour
    library and does not require Metamod's newer KHook interface.
 2. Copy the packaged `addons` folder into the server's `game/csgo` folder.
 3. Restart the server, then run `meta list` in the server console. Botmod should
@@ -113,11 +113,10 @@ snapshot when loaded through its VDF alias (otherwise use the plugin number).
 `meta refresh` loads it again. No configuration commands are needed.
 
 To update from 1.0.x, stop the server, overwrite its Botmod files with the
-**1.1.0** package for your platform, including **gamedata.ini**, and restart.
-`meta info <number>` should report version 1.1.0 and plugin API 17. The new
+**1.1.1** package for your platform, including **gamedata.ini**, and restart.
+`meta info <number>` should report version 1.1.1 and plugin API 17. The new
 engine-client offsets are required; using old gamedata rejects loading.
-After bots connect, look for `Published bot player info with fakeplayer=false`
-as well as the controller/pawn snapshot messages. Reconnect before checking
+After bots connect, run `botmod_status` as described below. Reconnect before checking
 the scoreboard and spectator HUD. Run Botmod as the label-removal plugin;
 remove the original Bot-Hider/BotHiderImpl if installed, since they modify
 the same identity fields and are not a supported combination.
@@ -140,7 +139,40 @@ The supplied, unmodified VStrikeIdentity 0.5.0 binary was tested alongside
 Botmod 1.1.0 on an API 17 Windows server: both naming commands succeeded,
 status continued to report `bot=True`, and recorded player info contained the
 new names with `fakeplayer=false`. No VStrike source changes are required.
-The rendered UI still needs a connected-client acceptance check.
+An actual connected Windows client also showed prefix-free scoreboard and
+overhead names. The reported failure on the user's server remains unresolved;
+this Windows result does not establish Linux runtime behavior.
+
+### If BOT still appears
+
+Version **1.1.1 adds diagnostics, not another confirmed label-removal fix**.
+The old startup message claimed publication succeeded after merely running
+the override. The new message reads back the actual `userinfo` record.
+
+With bots present, run these in the server console or through RCON and include
+their output when reporting the problem:
+
+```text
+version
+meta version
+meta list
+botmod_status
+```
+
+Also specify whether BOT appears in scoreboard names, overhead names, the
+spectator HUD, or another screen. `botmod_status` only reads state; it does not
+refresh identities or change bot behavior.
+
+- `pack_calls` should increase between calls; `last_controllers` should show
+  the bots included in the latest snapshot override.
+- `engine_client=INVALID` points to engine-client layout validation failing.
+- `published_fake=true`, `UNKNOWN`, or an identity mismatch means the current
+  player-info table does not contain the expected display identity.
+- `native_fake=1` and `engine_fake=1` are intentional: VStrike needs the native
+  server bot state. Clients should receive `published_fake=false identity=MATCH`.
+
+These checks distinguish loading, hook, client-layout, and publication problems.
+Even a matching player-info record does not prove every UI surface is correct.
 
 ## GitHub release builds
 
@@ -153,8 +185,8 @@ To publish a release, update the CMake project version and plugin version,
 commit the changes, and push a matching version tag:
 
 ```sh
-git tag v1.1.0
-git push origin main v1.1.0
+git tag v1.1.1
+git push origin main v1.1.1
 ```
 
 The tag must match `CMakeLists.txt`. After the build and tests pass, the workflow

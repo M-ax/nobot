@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(botmod VERSION 1.1.0 LANGUAGES C CXX)
+project(botmod VERSION 1.1.1 LANGUAGES C CXX)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
@@ -10,7 +10,7 @@ set(HL2SDK "${CMAKE_CURRENT_SOURCE_DIR}/.deps/hl2sdk-cs2" CACHE PATH "HL2SDK cs2
 set(SAFETYHOOK "${CMAKE_CURRENT_SOURCE_DIR}/.deps/safetyhook" CACHE PATH "SafetyHook checkout")
 set(ZYDIS "${CMAKE_CURRENT_SOURCE_DIR}/.deps/zydis" CACHE PATH "Zydis checkout")
 
-add_library(botmod_core STATIC src/display.cpp src/client_display.cpp src/pattern.cpp)
+add_library(botmod_core STATIC src/display.cpp src/client_display.cpp src/player_info.cpp src/pattern.cpp)
 target_include_directories(botmod_core PUBLIC src)
 target_compile_features(botmod_core PUBLIC cxx_std_17)
 set_target_properties(botmod_core PROPERTIES POSITION_INDEPENDENT_CODE ON)

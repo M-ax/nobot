@@ -1,6 +1,7 @@
 #include "display.h"
 #include "client_display.h"
 #include "pattern.h"
+#include "player_info.h"
 
 #include <safetyhook.hpp>
 #include <ISmmPlugin.h>
@@ -8,6 +9,9 @@
 #include <entity2/entitysystem.h>
 #include <schemasystem/schemasystem.h>
 #include <iserver.h>
+#include <icvar.h>
+#include <interfaces/interfaces.h>
+#include <networkstringtabledefs.h>
 
 #include <array>
 #include <atomic>
@@ -107,7 +111,7 @@ public:
     const char* GetDescription() override { return "Removes BOT name prefixes in the in-game player list"; }
     const char* GetURL() override { return ""; }
     const char* GetLicense() override { return "MIT"; }
-    const char* GetVersion() override { return "1.1.0"; }
+    const char* GetVersion() override { return "1.1.1"; }
     const char* GetDate() override { return __DATE__; }
     const char* GetLogTag() override { return "BOTMOD"; }
 
@@ -130,6 +134,17 @@ private:
     void* GetClient(CNetworkGameServerBase* server, int slot) const;
     std::uint64_t DisplayId(int slot, CEntityInstance* controller) const;
     void RefreshUserInfo();
+    static void Status();
+    std::optional<botmod::PlayerInfo> PublishedInfo(int slot) const;
+
+    ICvar* cvar_ = nullptr;
+    ConCommandRef statusCommand_;
+    INetworkStringTableContainer* tables_ = nullptr;
+    std::uint64_t packCalls_ = 0;
+    std::uint64_t userInfoCalls_ = 0;
+    std::uint64_t userInfoOverrides_ = 0;
+    int lastControllers_ = 0;
+    int lastPawns_ = 0;
 
     void* resources_ = nullptr;
     INetworkServerService* network_ = nullptr;
@@ -175,8 +190,10 @@ bool Botmod::Load(PluginId id, ISmmAPI* ismm, char* error, size_t maxlen, bool /
         auto factory = ismm->GetEngineFactory();
         resources_ = factory(GAMERESOURCESERVICESERVER_INTERFACE_VERSION, nullptr);
         network_ = static_cast<INetworkServerService*>(factory(NETWORKSERVERSERVICE_INTERFACE_VERSION, nullptr));
+        cvar_ = static_cast<ICvar*>(factory(CVAR_INTERFACE_VERSION, nullptr));
+        tables_ = static_cast<INetworkStringTableContainer*>(factory(INTERFACENAME_NETWORKSTRINGTABLESERVER, nullptr));
         auto* schema = static_cast<CSchemaSystem*>(factory(SCHEMASYSTEM_INTERFACE_VERSION, nullptr));
-        if (!resources_ || !schema || !network_)
+        if (!resources_ || !schema || !network_ || !cvar_ || !tables_)
             throw std::runtime_error("CS2 game resource or schema interface unavailable");
         auto* scope = schema->FindTypeScopeForModule(kServerModule);
         if (!scope)
@@ -238,11 +255,23 @@ bool Botmod::Load(PluginId id, ISmmAPI* ismm, char* error, size_t maxlen, bool /
             throw std::runtime_error("Could not enable the PackEntities hook");
         if (!EnsureUserInfoHook())
             throw std::runtime_error("Could not install player-info hooks");
+        ConCommandCreation_t command;
+        command.m_pszName = "botmod_status";
+        command.m_pszHelpString = "Print Botmod hooks, native bot state, and published player identities.";
+        command.m_nFlags = FCVAR_RELEASE;
+        command.m_CBInfo = ConCommandCallbackInfo_t(&Botmod::Status);
+        statusCommand_ = cvar_->RegisterConCommand(command);
+        if (!statusCommand_.IsValidRef())
+            throw std::runtime_error("Could not register botmod_status");
         ismm->AddListener(this, this);
-        META_CONPRINTF("[Botmod] Loaded 1.1.0 (Metamod API 17). Engine player-info and snapshot overrides; schema flags=%d, SteamID=%d, name=%d, pawn=%d, playerPawn=%d.\n",
+        META_CONPRINTF("[Botmod] Loaded 1.1.1 (Metamod API 17). Engine player-info and snapshot overrides; schema flags=%d, SteamID=%d, name=%d, pawn=%d, playerPawn=%d. Run botmod_status to verify publication.\n",
                        flags_.offset, steamId_.offset, name_.offset, pawn_.offset, playerPawn_.offset);
         return true;
     } catch (const std::exception& exception) {
+        if (cvar_ && statusCommand_.IsValidRef()) {
+            cvar_->UnregisterConCommandCallbacks(statusCommand_);
+            statusCommand_.InvalidateRef();
+        }
         userInfoHook_.reset();
         packHook_.reset();
         resources_ = nullptr;
@@ -306,6 +335,7 @@ void Botmod::UserInfoChanged(CNetworkGameServerBase* server, CPlayerSlot playerS
 {
     auto& self = g_Botmod;
     std::lock_guard lock(self.packingMutex_);
+    ++self.userInfoCalls_;
     ++self.userInfoDepth_;
     struct DepthOnExit {
         ~DepthOnExit() { --g_Botmod.userInfoDepth_; }
@@ -330,12 +360,15 @@ void Botmod::UserInfoChanged(CNetworkGameServerBase* server, CPlayerSlot playerS
     // here, including SetFakeClientConVar(name) from VStrikeIdentity.
     self.userInfoHook_.call<void>(server, playerSlot);
     if (display) {
+        ++self.userInfoOverrides_;
         if (self.GetClient(server, slot) != client ||
             botmod::ReadClient<std::uint16_t>(client, layout.userId) != userId)
             display->Abandon();
         display.reset();
         if (!self.reportedUserInfo_) {
-            META_CONPRINTF("[Botmod] Published bot player info with fakeplayer=false; native client state restored for VStrikeIdentity.\n");
+            const auto published = self.PublishedInfo(slot);
+            META_CONPRINTF("[Botmod] Player-info override ran; published slot=%d fakeplayer=%s. Native state restored for VStrikeIdentity. Run botmod_status for details.\n",
+                           slot, published ? (published->fake ? "true (FAILED)" : "false") : "unknown (unreadable userinfo)");
             self.reportedUserInfo_ = true;
         }
     }
@@ -351,6 +384,50 @@ void Botmod::RefreshUserInfo()
             !botmod::ReadClient<std::uint8_t>(client, clientLayout_.hltv))
             server->UserInfoChanged(CPlayerSlot(slot));
     }
+}
+
+std::optional<botmod::PlayerInfo> Botmod::PublishedInfo(int slot) const
+{
+    auto* table = tables_ ? tables_->FindTable("userinfo") : nullptr;
+    if (!table) return std::nullopt;
+    const auto key = std::to_string(slot);
+    const int index = table->FindStringIndex(key.c_str());
+    if (index < 0 || index >= table->GetNumStrings()) return std::nullopt;
+    const auto* data = table->GetStringUserData(index);
+    return data ? botmod::ReadPlayerInfo(data->m_pRawData, data->m_cbDataSize) : std::nullopt;
+}
+
+void Botmod::Status()
+{
+    auto& self = g_Botmod;
+    std::lock_guard lock(self.packingMutex_);
+    META_CONPRINTF("[Botmod] version=1.1.1 platform=%s API=17 pack_hook=%d userinfo_hook=%d pack_calls=%llu userinfo_calls=%llu overrides=%llu last_controllers=%d last_pawns=%d\n",
+                   kPlatform, !!self.packHook_, !!self.userInfoHook_,
+                   static_cast<unsigned long long>(self.packCalls_),
+                   static_cast<unsigned long long>(self.userInfoCalls_),
+                   static_cast<unsigned long long>(self.userInfoOverrides_), self.lastControllers_, self.lastPawns_);
+    auto* server = self.network_->GetIGameServer();
+    auto* system = self.EntitySystem();
+    int bots = 0;
+    for (int slot = 0; slot < kMaxPlayers; ++slot) {
+        auto* controller = GetEntity(system, slot + 1);
+        if (!controller || std::strcmp(controller->GetClassname(), "cs_player_controller") != 0 ||
+            At<bool>(controller, self.hltv_) ||
+            !(At<std::uint32_t>(controller, self.flags_) & botmod::kFakeClient)) continue;
+        ++bots;
+        auto* client = self.GetClient(server, slot);
+        const auto info = self.PublishedInfo(slot);
+        const auto expectedId = self.DisplayId(slot, controller);
+        const bool matches = info && !info->fake && !info->hltv && expectedId &&
+                             info->xuid == expectedId && info->steamId == expectedId;
+        META_CONPRINTF("[Botmod] slot=%d name=\"%.*s\" native_fake=1 engine_client=%s engine_fake=%d channel=%d published_fake=%s identity=%s\n",
+                       slot, self.name_.size, &At<char>(controller, self.name_), client ? "valid" : "INVALID",
+                       client ? botmod::ReadClient<std::uint8_t>(client, self.clientLayout_.fake) : -1,
+                       client ? !!botmod::ReadClient<void*>(client, self.clientLayout_.channel) : -1,
+                       info ? (info->fake ? "true" : "false") : "UNKNOWN",
+                       matches ? "MATCH" : (!expectedId ? "COLLISION" : "MISMATCH_OR_UNREADABLE"));
+    }
+    META_CONPRINTF("[Botmod] native_bots=%d. native_fake=1 is expected for VStrike; published_fake=false and identity=MATCH are expected for clients. Snapshot counts describe the latest pack, not a client UI check.\n", bots);
 }
 
 void Botmod::OnLevelInit(const char*, const char*, const char*, const char*, bool, bool)
@@ -393,6 +470,7 @@ void Botmod::PackPre()
     packingMutex_.lock();
     if (packingDepth_.fetch_add(1) != 0)
         return;
+    ++packCalls_;
 
     // Avoid sharing GameFrame/OnClientConnected hook managers with CSS. Its
     // deferred VStrike commands must keep ticking across unload and map change.
@@ -428,6 +506,8 @@ void Botmod::PackPre()
         OverridePawn(GetPawn(system, controller, playerPawn_));
         ++changed;
     }
+    lastControllers_ = changed;
+    lastPawns_ = static_cast<int>(pawnCount_);
     if (changed && !reported_) {
         META_CONPRINTF("[Botmod] Applied display overrides to %d bot(s); native state restores after packing.\n", changed);
         reported_ = true;
@@ -490,6 +570,10 @@ bool Botmod::Unload(char* error, size_t maxlen)
     }
     userInfoHook_.reset();
     packHook_.reset();
+    if (statusCommand_.IsValidRef()) {
+        cvar_->UnregisterConCommandCallbacks(statusCommand_);
+        statusCommand_.InvalidateRef();
+    }
     Restore();
     // Force the original values back into the next outgoing snapshot.
     auto* system = EntitySystem();

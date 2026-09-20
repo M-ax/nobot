@@ -1,4 +1,7 @@
-# Validation: 1.1.0
+# Validation: 1.1.1
+
+1.1.1 adds read-only publication diagnostics. It retains 1.1.0's identity
+behavior; the user's remaining BOT-prefix report is not yet resolved.
 
 ## Environment
 
@@ -55,11 +58,18 @@ hooks. The same rename sequence passed after that change.
 
 ## Remaining acceptance checks
 
-The scoreboard and spectator HUD have not been visually checked with a human
-client connected to 1.1.0. Player-info and entity recordings establish network
-state, not the final rendered UI. Active bot combat/movement also needs a
-connected-client check. Linux is compiled and unit tested; no Linux CS2 runtime
-test was performed here.
+A real Windows client connected to the isolated 1.1.0 server showed an
+unprefixed bot scoreboard row and unprefixed overhead names while spectating.
+The human player's name remained unchanged. This is narrower than acceptance
+of every spectator HUD element or the user's failing server. Linux is compiled
+and unit tested; no Linux CS2 runtime test was performed here.
+
+The 1.1.1 diagnostic build reports `published_fake=false identity=MATCH` for
+both bots after late loading, a VStrike team rename, a map change, and plugin
+unload/reload. The command callback is removed on unload and works again after
+reload. VStrike continues to report `bot=True`. The decoder tests include malformed lengths, truncated
+fixed64 fields, overflowing varints, repeated fields, and unknown fields;
+unreadable data must not be reported as a successful override.
 
 Two behaviors were reproduced in a fresh CSS/VStrike-only process with Botmod
 disabled for its entire lifetime: `bot_kick` did not recognize VStrike's new

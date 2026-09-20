@@ -133,6 +133,14 @@ jobs:
 
           Requires Linux x86-64, glibc 2.38+, and Metamod plugin API 17. The ZIP includes documentation and dependency license notices. `SHA256SUMS` covers all four downloads.
           NOTES
+          if [ "$VERSION" = "1.1.1" ]; then
+            cat >> release-notes.md <<'NOTES'
+
+          **Diagnostic release:** 1.1.1 adds the read-only `botmod_status` server/RCON command and verifies the actual published player-info record instead of assuming the override succeeded. It retains 1.1.0's identity behavior; the reported remaining BOT prefix is not yet resolved. Run `version`, `meta version`, `meta list`, and `botmod_status` with bots present, and report which UI screen still shows BOT.
+
+          Windows connected-client checks showed prefix-free scoreboard and overhead names. Windows and Linux builds/tests pass; Linux CS2 runtime behavior remains unverified.
+          NOTES
+          fi
           if draft=$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft); then
             if [ "$draft" != true ]; then
               echo "Release $RELEASE_TAG is already published; leaving its downloads unchanged."
